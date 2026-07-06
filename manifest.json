@@ -1,0 +1,14 @@
+{
+  "name": "Queue — TV Tracker",
+  "short_name": "Queue",
+  "description": "Track the shows you watch, episode by episode.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#131720",
+  "theme_color": "#131720",
+  "icons": [
+    { "src": "icons/icon-180.png", "sizes": "180x180", "type": "image/png" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}

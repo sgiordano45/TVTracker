@@ -1,0 +1,852 @@
+/* ============================================================
+   QUEUE — personal TV episode tracker (starter)
+   Storage: localStorage via Store adapter (swap for Firestore later)
+   Data:    TMDB API (key entered in Settings, stored locally)
+   ============================================================ */
+
+"use strict";
+
+/* ----------------------- Store (storage adapter) -----------------------
+   Everything reads/writes through this object. To move to Firebase later,
+   reimplement these five methods against Firestore and the rest of the
+   app doesn't change. */
+
+const Store = {
+  KEY: "queue.v1",
+
+  _blank() {
+    return { settings: { tmdbKey: "" }, shows: {} };
+  },
+
+  load() {
+    try {
+      const raw = localStorage.getItem(this.KEY);
+      if (!raw) return this._blank();
+      const data = JSON.parse(raw);
+      if (!data.settings) data.settings = { tmdbKey: "" };
+      if (!data.shows) data.shows = {};
+      return data;
+    } catch (e) {
+      console.error("Store.load failed", e);
+      return this._blank();
+    }
+  },
+
+  save(state) {
+    try {
+      localStorage.setItem(this.KEY, JSON.stringify(state));
+    } catch (e) {
+      console.error("Store.save failed", e);
+      toast("Couldn't save — storage may be full");
+    }
+  },
+
+  exportJSON(state) {
+    return JSON.stringify(state, null, 2);
+  },
+
+  importJSON(text) {
+    const data = JSON.parse(text); // throws if invalid
+    if (!data.shows || typeof data.shows !== "object") {
+      throw new Error("Not a Queue backup file");
+    }
+    if (!data.settings) data.settings = { tmdbKey: "" };
+    return data;
+  },
+};
+
+let state = Store.load();
+function persist() { Store.save(state); }
+
+/* ----------------------- TMDB client ----------------------- */
+
+const TMDB = {
+  base: "https://api.themoviedb.org/3",
+  img: (path, size) => path ? `https://image.tmdb.org/t/p/${size || "w342"}${path}` : null,
+
+  hasKey() { return !!(state.settings.tmdbKey && state.settings.tmdbKey.trim()); },
+
+  async get(path, params) {
+    const key = (state.settings.tmdbKey || "").trim();
+    if (!key) throw new Error("NO_KEY");
+
+    const url = new URL(this.base + path);
+    const headers = { Accept: "application/json" };
+
+    // v4 Read Access Tokens are long JWTs starting with "eyJ"; v3 keys are short hex
+    if (key.startsWith("eyJ")) {
+      headers.Authorization = "Bearer " + key;
+    } else {
+      url.searchParams.set("api_key", key);
+    }
+    for (const [k, v] of Object.entries(params || {})) {
+      url.searchParams.set(k, v);
+    }
+
+    const res = await fetch(url, { headers });
+    if (res.status === 401) throw new Error("BAD_KEY");
+    if (!res.ok) throw new Error("TMDB error " + res.status);
+    return res.json();
+  },
+
+  searchTV(query) {
+    return this.get("/search/tv", { query, include_adult: "false" });
+  },
+
+  showDetail(id) {
+    return this.get(`/tv/${id}`);
+  },
+
+  season(id, n) {
+    return this.get(`/tv/${id}/season/${n}`);
+  },
+};
+
+/* ----------------------- Episode data / cache -----------------------
+   Per show we cache a flat, ordered episode list (specials excluded):
+   [{ s, e, name, air }] — refreshed when >24h old and online. */
+
+const CACHE_TTL = 24 * 60 * 60 * 1000;
+
+function epKey(s, e) { return `s${s}e${e}`; }
+
+function todayISO() {
+  const d = new Date();
+  return d.getFullYear() + "-" +
+    String(d.getMonth() + 1).padStart(2, "0") + "-" +
+    String(d.getDate()).padStart(2, "0");
+}
+
+function hasAired(ep) {
+  return !!ep.air && ep.air <= todayISO();
+}
+
+async function fetchEpisodeList(tmdbId) {
+  const detail = await TMDB.showDetail(tmdbId);
+  const seasonNums = (detail.seasons || [])
+    .filter(s => s.season_number > 0)
+    .map(s => s.season_number)
+    .sort((a, b) => a - b);
+
+  const episodes = [];
+  for (const n of seasonNums) {
+    const season = await TMDB.season(tmdbId, n);
+    for (const ep of (season.episodes || [])) {
+      episodes.push({
+        s: ep.season_number,
+        e: ep.episode_number,
+        name: ep.name || `Episode ${ep.episode_number}`,
+        air: ep.air_date || null,
+      });
+    }
+  }
+  return {
+    episodes,
+    status: detail.status || "",
+    nextAir: detail.next_episode_to_air ? detail.next_episode_to_air.air_date : null,
+  };
+}
+
+async function ensureEpisodes(show, force) {
+  const fresh = show.cache && (Date.now() - show.cache.fetchedAt < CACHE_TTL);
+  if (fresh && !force) return show.cache;
+  try {
+    const data = await fetchEpisodeList(show.id);
+    show.cache = { fetchedAt: Date.now(), ...data };
+    persist();
+  } catch (e) {
+    if (!show.cache) throw e; // nothing cached and fetch failed
+    // otherwise fall back silently to stale cache
+  }
+  return show.cache;
+}
+
+/* ----------------------- Progress helpers ----------------------- */
+
+function airedEpisodes(show) {
+  if (!show.cache) return [];
+  return show.cache.episodes.filter(hasAired);
+}
+
+function watchedCount(show) {
+  return Object.keys(show.watched || {}).length;
+}
+
+function nextUnwatched(show) {
+  if (!show.cache) return null;
+  for (const ep of show.cache.episodes) {
+    if (!show.watched[epKey(ep.s, ep.e)]) return ep;
+  }
+  return null;
+}
+
+function remainingAired(show) {
+  return airedEpisodes(show).filter(ep => !show.watched[epKey(ep.s, ep.e)]).length;
+}
+
+/* ----------------------- Actions ----------------------- */
+
+function addShow(result) {
+  const id = String(result.id);
+  if (state.shows[id]) { toast("Already in your shows"); return; }
+  state.shows[id] = {
+    id: result.id,
+    name: result.name,
+    poster: result.poster_path || null,
+    year: (result.first_air_date || "").slice(0, 4),
+    status: "watching",           // watching | plan | done
+    watched: {},
+    addedAt: Date.now(),
+    cache: null,
+  };
+  persist();
+  toast(`Added ${result.name}`);
+  // warm the cache in the background
+  ensureEpisodes(state.shows[id]).then(() => {
+    if (currentRoute.startsWith("upnext")) render();
+  }).catch(() => {});
+}
+
+function removeShow(id) {
+  const name = state.shows[id] ? state.shows[id].name : "show";
+  delete state.shows[id];
+  persist();
+  toast(`Removed ${name}`);
+  navigate("shows");
+}
+
+function toggleEpisode(show, s, e) {
+  const k = epKey(s, e);
+  if (show.watched[k]) delete show.watched[k];
+  else show.watched[k] = Date.now();
+  autoStatus(show);
+  persist();
+}
+
+function markThrough(show, s, e) {
+  // mark this episode and everything before it (aired only)
+  for (const ep of show.cache.episodes) {
+    if (ep.s < s || (ep.s === s && ep.e <= e)) {
+      if (hasAired(ep)) show.watched[epKey(ep.s, ep.e)] = show.watched[epKey(ep.s, ep.e)] || Date.now();
+    }
+  }
+  autoStatus(show);
+  persist();
+}
+
+function markSeason(show, s, on) {
+  for (const ep of show.cache.episodes) {
+    if (ep.s === s && hasAired(ep)) {
+      if (on) show.watched[epKey(ep.s, ep.e)] = show.watched[epKey(ep.s, ep.e)] || Date.now();
+      else delete show.watched[epKey(ep.s, ep.e)];
+    }
+  }
+  autoStatus(show);
+  persist();
+}
+
+function autoStatus(show) {
+  // If every aired episode is watched and the series has ended, mark done.
+  if (!show.cache) return;
+  const aired = airedEpisodes(show);
+  const allWatched = aired.length > 0 && aired.every(ep => show.watched[epKey(ep.s, ep.e)]);
+  const ended = ["Ended", "Canceled"].includes(show.cache.status);
+  if (allWatched && ended && show.status !== "done") show.status = "done";
+  if (!allWatched && show.status === "done") show.status = "watching";
+}
+
+/* ----------------------- Rendering utilities ----------------------- */
+
+const $view = document.getElementById("view");
+const $brand = document.getElementById("brandTitle");
+
+function h(html) {
+  const t = document.createElement("template");
+  t.innerHTML = html.trim();
+  return t.content;
+}
+
+function esc(str) {
+  return String(str == null ? "" : str)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function fmtDate(iso) {
+  if (!iso) return "";
+  const [y, m, d] = iso.split("-").map(Number);
+  const dt = new Date(y, m - 1, d);
+  return dt.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+}
+
+let toastTimer = null;
+function toast(msg) {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  el.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove("show"), 2200);
+}
+
+/* ----------------------- Views ----------------------- */
+
+/* ---- UP NEXT ---- */
+
+async function viewUpNext() {
+  $brand.innerHTML = 'UP <span class="accent">NEXT</span>';
+
+  const shows = Object.values(state.shows);
+  if (!shows.length) {
+    $view.replaceChildren(h(`
+      <div class="empty">
+        <div class="big">Nothing queued</div>
+        Add a show from the Search tab and your next episode will land here.
+        <div><button class="btn btn-check" data-go="search">Find a show</button></div>
+      </div>`));
+    return;
+  }
+  if (!TMDB.hasKey()) {
+    $view.replaceChildren(h(`
+      <div class="empty">
+        <div class="big">One setup step</div>
+        Paste your free TMDB API key in Settings to load episode data.
+        <div><button class="btn btn-check" data-go="settings">Open Settings</button></div>
+      </div>`));
+    return;
+  }
+
+  $view.replaceChildren(h(`<div class="empty">Loading your queue&hellip;</div>`));
+
+  // make sure caches exist (fetch any missing, tolerate stale)
+  const active = shows.filter(s => s.status !== "plan");
+  await Promise.all(active.map(s => ensureEpisodes(s).catch(() => {})));
+
+  const cards = [];
+  for (const show of active) {
+    if (!show.cache) continue;
+    const next = nextUnwatched(show);
+    if (!next) continue;
+    cards.push({ show, next, behind: remainingAired(show) });
+  }
+  // shows you're furthest behind on... actually: most recently added / most behind first, aired first
+  cards.sort((a, b) => {
+    const aAired = hasAired(a.next) ? 0 : 1;
+    const bAired = hasAired(b.next) ? 0 : 1;
+    if (aAired !== bAired) return aAired - bAired;
+    return b.behind - a.behind;
+  });
+
+  if (!cards.length) {
+    $view.replaceChildren(h(`
+      <div class="empty">
+        <div class="big">All caught up</div>
+        No unwatched episodes right now. Nicely done.
+      </div>`));
+    return;
+  }
+
+  const frag = document.createDocumentFragment();
+  const readySection = cards.filter(c => hasAired(c.next));
+  const upcomingSection = cards.filter(c => !hasAired(c.next));
+
+  if (readySection.length) {
+    frag.append(h(`<div class="section-label">Ready to watch</div>`));
+    readySection.forEach(c => frag.append(nextCard(c)));
+  }
+  if (upcomingSection.length) {
+    frag.append(h(`<div class="section-label">Coming up</div>`));
+    upcomingSection.forEach(c => frag.append(nextCard(c)));
+  }
+  $view.replaceChildren(frag);
+}
+
+function nextCard({ show, next, behind }) {
+  const aired = airedEpisodes(show);
+  const total = aired.length;
+  const MAXTICKS = 60;
+  let ticks = "";
+  if (total <= MAXTICKS) {
+    ticks = aired.map(ep => {
+      const k = epKey(ep.s, ep.e);
+      const cls = show.watched[k] ? "done" : (ep.s === next.s && ep.e === next.e ? "next" : "");
+      return `<span class="tick ${cls}"></span>`;
+    }).join("");
+  } else {
+    // compress: show season-level ticks for long series
+    const seasons = [...new Set(aired.map(ep => ep.s))];
+    ticks = seasons.map(sn => {
+      const eps = aired.filter(ep => ep.s === sn);
+      const done = eps.every(ep => show.watched[epKey(ep.s, ep.e)]);
+      const isNext = sn === next.s;
+      return `<span class="tick ${done ? "done" : isNext ? "next" : ""}" style="width:14px"></span>`;
+    }).join("");
+  }
+
+  const posterUrl = TMDB.img(show.poster, "w185");
+  const airedFlag = hasAired(next);
+  const meta = airedFlag
+    ? `${behind} unwatched &middot; ${fmtDate(next.air)}`
+    : (next.air ? `Airs ${fmtDate(next.air)}` : "Air date TBA");
+
+  const el = h(`
+    <article class="next-card" data-id="${show.id}">
+      ${posterUrl
+        ? `<img class="next-poster" src="${posterUrl}" alt="" loading="lazy">`
+        : `<div class="next-poster noart">${esc(show.name)}</div>`}
+      <div class="next-body">
+        <div class="next-show">${esc(show.name)}</div>
+        <div class="next-code">S${next.s}<span class="dot">&middot;</span>E${next.e}</div>
+        <div class="next-eptitle">${esc(next.name)}</div>
+        <div class="next-meta">${meta}</div>
+        <div class="tickstrip">${ticks}</div>
+        <div class="next-actions">
+          ${airedFlag ? `<button class="btn btn-check" data-watch>Watched &#10003;</button>` : ""}
+          <button class="btn btn-quiet" data-open>Details</button>
+        </div>
+      </div>
+    </article>`);
+
+  const card = el.querySelector(".next-card");
+  const watchBtn = card.querySelector("[data-watch]");
+  if (watchBtn) {
+    watchBtn.addEventListener("click", () => {
+      toggleEpisode(show, next.s, next.e);
+      toast(`S${next.s}E${next.e} marked watched`);
+      render();
+    });
+  }
+  card.querySelector("[data-open]").addEventListener("click", () => navigate("show/" + show.id));
+  return el;
+}
+
+/* ---- MY SHOWS ---- */
+
+let showsFilter = "watching";
+
+function viewShows() {
+  $brand.innerHTML = 'MY <span class="accent">SHOWS</span>';
+
+  const shows = Object.values(state.shows)
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  const counts = {
+    watching: shows.filter(s => s.status === "watching").length,
+    plan: shows.filter(s => s.status === "plan").length,
+    done: shows.filter(s => s.status === "done").length,
+    all: shows.length,
+  };
+
+  const filtered = showsFilter === "all" ? shows : shows.filter(s => s.status === showsFilter);
+
+  const chips = [
+    ["watching", "Watching"],
+    ["plan", "Plan to watch"],
+    ["done", "Finished"],
+    ["all", "All"],
+  ].map(([key, label]) =>
+    `<button class="chip ${showsFilter === key ? "active" : ""}" data-filter="${key}">${label} ${counts[key] ? "&middot; " + counts[key] : ""}</button>`
+  ).join("");
+
+  let body;
+  if (!shows.length) {
+    body = `<div class="empty"><div class="big">No shows yet</div>Head to Search and add what you're watching.</div>`;
+  } else if (!filtered.length) {
+    body = `<div class="empty">Nothing in this list.</div>`;
+  } else {
+    body = `<div class="poster-grid">` + filtered.map(show => {
+      const posterUrl = TMDB.img(show.poster, "w342");
+      const remain = show.cache ? remainingAired(show) : null;
+      const badge = show.status === "done"
+        ? `<span class="badge done">&#10003;</span>`
+        : (remain ? `<span class="badge">${remain}</span>` : "");
+      return `
+        <div class="poster-cell" data-id="${show.id}" role="button" tabindex="0">
+          ${posterUrl ? `<img src="${posterUrl}" alt="${esc(show.name)}" loading="lazy">`
+                      : `<div class="noart">${esc(show.name)}</div>`}
+          ${badge}
+          <div class="poster-title">${esc(show.name)}</div>
+        </div>`;
+    }).join("") + `</div>`;
+  }
+
+  $view.replaceChildren(h(`<div class="filters">${chips}</div>${body}`));
+
+  $view.querySelectorAll("[data-filter]").forEach(el =>
+    el.addEventListener("click", () => { showsFilter = el.dataset.filter; viewShows(); }));
+  $view.querySelectorAll(".poster-cell").forEach(el => {
+    const go = () => navigate("show/" + el.dataset.id);
+    el.addEventListener("click", go);
+    el.addEventListener("keydown", e => { if (e.key === "Enter") go(); });
+  });
+}
+
+/* ---- SEARCH ---- */
+
+let lastResults = [];
+
+function viewSearch() {
+  $brand.innerHTML = '<span class="accent">SEARCH</span>';
+
+  $view.replaceChildren(h(`
+    <div class="searchbox">
+      <input id="q" type="search" placeholder="Show name&hellip;" autocomplete="off" enterkeyhint="search">
+    </div>
+    <div id="results"></div>`));
+
+  const input = $view.querySelector("#q");
+  const resultsEl = $view.querySelector("#results");
+
+  if (!TMDB.hasKey()) {
+    resultsEl.replaceChildren(h(`
+      <div class="empty">Add your TMDB API key in Settings first — takes about two minutes and it's free.</div>`));
+  } else if (lastResults.length) {
+    renderResults(resultsEl, lastResults);
+  }
+
+  let timer = null;
+  input.addEventListener("input", () => {
+    clearTimeout(timer);
+    const q = input.value.trim();
+    if (q.length < 2) { resultsEl.replaceChildren(); return; }
+    timer = setTimeout(async () => {
+      try {
+        const data = await TMDB.searchTV(q);
+        lastResults = (data.results || []).slice(0, 20);
+        renderResults(resultsEl, lastResults);
+      } catch (e) {
+        resultsEl.replaceChildren(h(`<div class="empty">${e.message === "NO_KEY"
+          ? "Add your TMDB key in Settings first."
+          : e.message === "BAD_KEY"
+            ? "TMDB rejected that key — double-check it in Settings."
+            : "Search failed. Check your connection and try again."}</div>`));
+      }
+    }, 350);
+  });
+  input.focus();
+}
+
+function renderResults(container, results) {
+  if (!results.length) {
+    container.replaceChildren(h(`<div class="empty">No matches.</div>`));
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  for (const r of results) {
+    const have = !!state.shows[String(r.id)];
+    const posterUrl = TMDB.img(r.poster_path, "w154");
+    const year = (r.first_air_date || "").slice(0, 4);
+    const el = h(`
+      <div class="result-row">
+        ${posterUrl ? `<img src="${posterUrl}" alt="" loading="lazy">` : `<div class="noart-sm">No art</div>`}
+        <div>
+          <div class="result-name">${esc(r.name)}</div>
+          <div class="result-sub">${year || "&mdash;"}${r.origin_country && r.origin_country.length ? " &middot; " + esc(r.origin_country[0]) : ""}</div>
+        </div>
+        <button class="addbtn" ${have ? "disabled" : ""}>${have ? "Added &#10003;" : "+ Add"}</button>
+      </div>`);
+    const btn = el.querySelector("button");
+    if (!have) {
+      btn.addEventListener("click", () => {
+        addShow(r);
+        btn.disabled = true;
+        btn.innerHTML = "Added &#10003;";
+      });
+    }
+    frag.append(el);
+  }
+  container.replaceChildren(frag);
+}
+
+/* ---- SHOW DETAIL ---- */
+
+const openSeasons = {}; // remember which accordions are open per show
+
+async function viewShowDetail(id) {
+  const show = state.shows[id];
+  if (!show) { navigate("shows"); return; }
+
+  $brand.innerHTML = '<span class="accent">SHOW</span>';
+  $view.replaceChildren(h(`<div class="empty">Loading episodes&hellip;</div>`));
+
+  try {
+    await ensureEpisodes(show);
+  } catch (e) {
+    $view.replaceChildren(h(`
+      <a class="backlink" data-go="shows">&larr; My Shows</a>
+      <div class="empty">${e.message === "NO_KEY"
+        ? "Add your TMDB key in Settings to load episodes."
+        : "Couldn't load episode data. Check your connection."}</div>`));
+    wireGoLinks();
+    return;
+  }
+
+  const eps = show.cache.episodes;
+  const seasons = [...new Set(eps.map(ep => ep.s))].sort((a, b) => a - b);
+  const posterUrl = TMDB.img(show.poster, "w342");
+  const aired = airedEpisodes(show);
+  const watched = aired.filter(ep => show.watched[epKey(ep.s, ep.e)]).length;
+
+  if (!(id in openSeasons)) {
+    // default open: the season containing the next unwatched episode
+    const nx = nextUnwatched(show);
+    openSeasons[id] = nx ? nx.s : (seasons[seasons.length - 1] || 1);
+  }
+
+  const statusChips = [
+    ["watching", "Watching"],
+    ["plan", "Plan to watch"],
+    ["done", "Finished"],
+  ].map(([key, label]) =>
+    `<button class="chip ${show.status === key ? "active" : ""}" data-status="${key}">${label}</button>`
+  ).join("");
+
+  const seasonBlocks = seasons.map(sn => {
+    const sEps = eps.filter(ep => ep.s === sn);
+    const sAired = sEps.filter(hasAired);
+    const sDone = sAired.filter(ep => show.watched[epKey(ep.s, ep.e)]).length;
+    const open = openSeasons[id] === sn;
+
+    const rows = !open ? "" : sEps.map(ep => {
+      const k = epKey(ep.s, ep.e);
+      const isWatched = !!show.watched[k];
+      const future = !hasAired(ep);
+      return `
+        <div class="ep-row ${isWatched ? "watched" : ""} ${future ? "future" : ""}" data-s="${ep.s}" data-e="${ep.e}">
+          <div class="ep-num">E${ep.e}</div>
+          <div class="ep-name">
+            <span class="t">${esc(ep.name)}</span>
+            <span class="d">${future ? "Airs " : ""}${fmtDate(ep.air) || "TBA"}</span>
+          </div>
+          <button class="checkbox" aria-label="Toggle watched">&#10003;</button>
+        </div>`;
+    }).join("");
+
+    return `
+      <div class="season">
+        <button class="season-head" data-season="${sn}">
+          <span class="season-name">Season ${sn}</span>
+          <span class="season-count"><span class="done-count">${sDone}</span> / ${sAired.length}${sEps.length > sAired.length ? " aired" : ""}</span>
+        </button>
+        ${open ? `
+          <div class="season-body">${rows}</div>
+          <div class="season-actions">
+            <button class="minibtn" data-mark-season="${sn}">Mark season watched</button>
+            <button class="minibtn" data-clear-season="${sn}">Clear</button>
+          </div>` : ""}
+      </div>`;
+  }).join("");
+
+  $view.replaceChildren(h(`
+    <a class="backlink" data-go="shows">&larr; My Shows</a>
+    <div class="detail-hero">
+      ${posterUrl ? `<img src="${posterUrl}" alt="">` : `<div class="noart">${esc(show.name)}</div>`}
+      <div>
+        <div class="detail-title">${esc(show.name)}</div>
+        <div class="detail-sub">
+          ${show.year || ""}${show.cache.status ? " &middot; " + esc(show.cache.status) : ""}<br>
+          <span style="color:var(--green)">${watched}</span> of ${aired.length} aired episodes watched
+          ${show.cache.nextAir ? `<br>Next episode ${fmtDate(show.cache.nextAir)}` : ""}
+        </div>
+      </div>
+    </div>
+    <div class="status-row">${statusChips}</div>
+    <div class="detail-actions">
+      <button class="minibtn" data-caughtup>I'm caught up &mdash; mark all aired</button>
+      <button class="minibtn danger" data-remove>Remove show</button>
+    </div>
+    ${seasonBlocks}`));
+
+  wireGoLinks();
+
+  $view.querySelectorAll("[data-status]").forEach(el =>
+    el.addEventListener("click", () => {
+      show.status = el.dataset.status;
+      persist();
+      viewShowDetail(id);
+    }));
+
+  $view.querySelectorAll("[data-season]").forEach(el =>
+    el.addEventListener("click", () => {
+      const sn = Number(el.dataset.season);
+      openSeasons[id] = openSeasons[id] === sn ? null : sn;
+      viewShowDetail(id);
+    }));
+
+  $view.querySelectorAll(".ep-row .checkbox").forEach(btn =>
+    btn.addEventListener("click", () => {
+      const row = btn.closest(".ep-row");
+      toggleEpisode(show, Number(row.dataset.s), Number(row.dataset.e));
+      viewShowDetail(id);
+    }));
+
+  $view.querySelectorAll("[data-mark-season]").forEach(el =>
+    el.addEventListener("click", () => {
+      markSeason(show, Number(el.dataset.markSeason), true);
+      viewShowDetail(id);
+    }));
+  $view.querySelectorAll("[data-clear-season]").forEach(el =>
+    el.addEventListener("click", () => {
+      markSeason(show, Number(el.dataset.clearSeason), false);
+      viewShowDetail(id);
+    }));
+
+  $view.querySelector("[data-caughtup]").addEventListener("click", () => {
+    const last = airedEpisodes(show).slice(-1)[0];
+    if (last) {
+      markThrough(show, last.s, last.e);
+      toast("Marked all aired episodes watched");
+      viewShowDetail(id);
+    }
+  });
+
+  $view.querySelector("[data-remove]").addEventListener("click", () => {
+    if (confirm(`Remove ${show.name} and its watch history?`)) removeShow(id);
+  });
+}
+
+/* ---- SETTINGS ---- */
+
+function viewSettings() {
+  $brand.innerHTML = '<span class="accent">SETTINGS</span>';
+
+  const shows = Object.values(state.shows);
+  const totalWatched = shows.reduce((n, s) => n + watchedCount(s), 0);
+
+  $view.replaceChildren(h(`
+    <div class="card">
+      <h3>TMDB API key</h3>
+      <p>Episode data comes from <a href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener">The Movie Database</a>.
+      Create a free account, request an API key (personal use), and paste either the short v3 key or the long Read Access Token here. It's stored only on this device.</p>
+      <input class="field" id="tmdbKey" type="text" placeholder="Paste key" value="${esc(state.settings.tmdbKey)}" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <div style="display:flex; gap:8px">
+        <button class="btn btn-check" id="saveKey">Save key</button>
+        <button class="btn btn-quiet" id="testKey">Test</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Your numbers</h3>
+      <div class="stat-row"><span>Shows tracked</span><span class="v">${shows.length}</span></div>
+      <div class="stat-row"><span>Currently watching</span><span class="v">${shows.filter(s => s.status === "watching").length}</span></div>
+      <div class="stat-row"><span>Episodes watched</span><span class="v">${totalWatched}</span></div>
+    </div>
+
+    <div class="card">
+      <h3>Backup</h3>
+      <p>Everything lives in this browser. Export a backup before clearing Safari data, or to move to another device.</p>
+      <div style="display:flex; gap:8px; flex-wrap:wrap">
+        <button class="btn btn-quiet" id="exportBtn">Export JSON</button>
+        <button class="btn btn-quiet" id="importBtn">Import</button>
+        <input type="file" id="importFile" accept="application/json" style="display:none">
+      </div>
+    </div>`));
+
+  $view.querySelector("#saveKey").addEventListener("click", () => {
+    state.settings.tmdbKey = $view.querySelector("#tmdbKey").value.trim();
+    persist();
+    toast("Key saved");
+  });
+
+  $view.querySelector("#testKey").addEventListener("click", async () => {
+    state.settings.tmdbKey = $view.querySelector("#tmdbKey").value.trim();
+    persist();
+    try {
+      await TMDB.get("/configuration");
+      toast("Key works \u2713");
+    } catch (e) {
+      toast(e.message === "NO_KEY" ? "Paste a key first" : "TMDB rejected that key");
+    }
+  });
+
+  $view.querySelector("#exportBtn").addEventListener("click", () => {
+    const blob = new Blob([Store.exportJSON(state)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "queue-backup-" + todayISO() + ".json";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  });
+
+  $view.querySelector("#importBtn").addEventListener("click", () =>
+    $view.querySelector("#importFile").click());
+
+  $view.querySelector("#importFile").addEventListener("change", async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      state = Store.importJSON(text);
+      persist();
+      toast("Backup imported");
+      viewSettings();
+    } catch {
+      toast("That file didn't look like a Queue backup");
+    }
+  });
+}
+
+/* ----------------------- Router ----------------------- */
+
+let currentRoute = "upnext";
+
+function navigate(route) {
+  location.hash = "#/" + route;
+}
+
+function render() {
+  const route = currentRoute;
+  document.querySelectorAll(".tab").forEach(t =>
+    t.classList.toggle("active", route.split("/")[0] === t.dataset.route ||
+      (route.startsWith("show/") && t.dataset.route === "shows")));
+
+  window.scrollTo(0, 0);
+  if (route === "upnext") viewUpNext();
+  else if (route === "shows") viewShows();
+  else if (route === "search") viewSearch();
+  else if (route === "settings") viewSettings();
+  else if (route.startsWith("show/")) viewShowDetail(route.slice(5));
+  else viewUpNext();
+}
+
+function onHashChange() {
+  currentRoute = (location.hash || "#/upnext").replace(/^#\//, "");
+  render();
+}
+
+function wireGoLinks() {
+  $view.querySelectorAll("[data-go]").forEach(el =>
+    el.addEventListener("click", () => navigate(el.dataset.go)));
+}
+
+/* generic delegate for empty-state buttons rendered before wireGoLinks */
+document.addEventListener("click", (e) => {
+  const go = e.target.closest("[data-go]");
+  if (go && !go.dataset.wired) navigate(go.dataset.go);
+});
+
+document.querySelectorAll(".tab").forEach(t =>
+  t.addEventListener("click", () => navigate(t.dataset.route)));
+
+document.getElementById("refreshBtn").addEventListener("click", async (e) => {
+  const btn = e.currentTarget;
+  if (!TMDB.hasKey()) { toast("Add your TMDB key in Settings first"); return; }
+  btn.classList.add("spin");
+  const shows = Object.values(state.shows);
+  await Promise.all(shows.map(s => ensureEpisodes(s, true).catch(() => {})));
+  btn.classList.remove("spin");
+  toast("Episode data refreshed");
+  render();
+});
+
+window.addEventListener("hashchange", onHashChange);
+
+/* ----------------------- Service worker ----------------------- */
+
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("sw.js").catch(() => {});
+  });
+}
+
+/* go */
+onHashChange();
