@@ -161,6 +161,18 @@ async function ensureEpisodes(show, force) {
   return show.cache;
 }
 
+async function ensureAll(shows, force) {
+  // fetch episode caches with limited concurrency (kind to TMDB after a big import)
+  const queue = [...shows];
+  const worker = async () => {
+    while (queue.length) {
+      const s = queue.shift();
+      await ensureEpisodes(s, force).catch(() => {});
+    }
+  };
+  await Promise.all(Array.from({ length: 6 }, worker));
+}
+
 /* ----------------------- Progress helpers ----------------------- */
 
 function airedEpisodes(show) {
@@ -184,9 +196,30 @@ function remainingAired(show) {
   return airedEpisodes(show).filter(ep => !show.watched[epKey(ep.s, ep.e)]).length;
 }
 
+const STALE_DAYS = 30;
+
+function lastWatchedAt(show) {
+  const times = Object.values(show.watched || {});
+  return times.length ? Math.max(...times) : (show.addedAt || 0);
+}
+
+function isStale(show) {
+  return Date.now() - lastWatchedAt(show) > STALE_DAYS * 24 * 60 * 60 * 1000;
+}
+
+function timeAgo(ts) {
+  const days = Math.floor((Date.now() - ts) / (24 * 60 * 60 * 1000));
+  if (days < 1) return "today";
+  if (days === 1) return "yesterday";
+  if (days < 30) return days + "d ago";
+  if (days < 365) return Math.floor(days / 30) + "mo ago";
+  const y = Math.floor(days / 365);
+  return y + (y === 1 ? " yr ago" : " yrs ago");
+}
+
 /* ----------------------- Actions ----------------------- */
 
-function addShow(result) {
+function addShow(result, status) {
   const id = String(result.id);
   if (state.shows[id]) { toast("Already in your shows"); return; }
   state.shows[id] = {
@@ -194,13 +227,13 @@ function addShow(result) {
     name: result.name,
     poster: result.poster_path || null,
     year: (result.first_air_date || "").slice(0, 4),
-    status: "watching",           // watching | plan | done
+    status: status || "watching",   // watching | plan | done | stopped
     watched: {},
     addedAt: Date.now(),
     cache: null,
   };
   persist();
-  toast(`Added ${result.name}`);
+  toast(status === "plan" ? `${result.name} saved for later` : `Added ${result.name}`);
   // warm the cache in the background
   ensureEpisodes(state.shows[id]).then(() => {
     if (currentRoute.startsWith("upnext")) render();
@@ -251,6 +284,7 @@ function autoStatus(show) {
   const aired = airedEpisodes(show);
   const allWatched = aired.length > 0 && aired.every(ep => show.watched[epKey(ep.s, ep.e)]);
   const ended = ["Ended", "Canceled"].includes(show.cache.status);
+  if (show.status === "stopped") return; // user's call — don't auto-flip
   if (allWatched && ended && show.status !== "done") show.status = "done";
   if (!allWatched && show.status === "done") show.status = "watching";
 }
@@ -318,8 +352,8 @@ async function viewUpNext() {
   $view.replaceChildren(h(`<div class="empty">Loading your queue&hellip;</div>`));
 
   // make sure caches exist (fetch any missing, tolerate stale)
-  const active = shows.filter(s => s.status !== "plan");
-  await Promise.all(active.map(s => ensureEpisodes(s).catch(() => {})));
+  const active = shows.filter(s => s.status !== "plan" && s.status !== "stopped");
+  await ensureAll(active);
 
   const cards = [];
   for (const show of active) {
@@ -346,12 +380,23 @@ async function viewUpNext() {
   }
 
   const frag = document.createDocumentFragment();
-  const readySection = cards.filter(c => hasAired(c.next));
+  const ready = cards.filter(c => hasAired(c.next));
+  const continueSection = ready.filter(c => !isStale(c.show));
+  const staleSection = ready.filter(c => isStale(c.show));
   const upcomingSection = cards.filter(c => !hasAired(c.next));
 
-  if (readySection.length) {
-    frag.append(h(`<div class="section-label">Ready to watch</div>`));
-    readySection.forEach(c => frag.append(nextCard(c)));
+  // within sections: most recently watched first feels right for "continue",
+  // most-behind first for the backlog
+  continueSection.sort((a, b) => lastWatchedAt(b.show) - lastWatchedAt(a.show));
+  staleSection.sort((a, b) => b.behind - a.behind);
+
+  if (continueSection.length) {
+    frag.append(h(`<div class="section-label">Continue watching</div>`));
+    continueSection.forEach(c => frag.append(nextCard(c)));
+  }
+  if (staleSection.length) {
+    frag.append(h(`<div class="section-label">Pick it back up</div>`));
+    staleSection.forEach(c => frag.append(nextCard(c)));
   }
   if (upcomingSection.length) {
     frag.append(h(`<div class="section-label">Coming up</div>`));
@@ -384,8 +429,10 @@ function nextCard({ show, next, behind }) {
 
   const posterUrl = TMDB.img(show.poster, "w185");
   const airedFlag = hasAired(next);
+  const hasHistory = Object.keys(show.watched || {}).length > 0;
+  const ago = hasHistory ? ` &middot; watched ${timeAgo(lastWatchedAt(show))}` : "";
   const meta = airedFlag
-    ? `${behind} unwatched &middot; ${fmtDate(next.air)}`
+    ? `${behind} unwatched${ago}`
     : (next.air ? `Airs ${fmtDate(next.air)}` : "Air date TBA");
 
   const el = h(`
@@ -433,6 +480,7 @@ function viewShows() {
     watching: shows.filter(s => s.status === "watching").length,
     plan: shows.filter(s => s.status === "plan").length,
     done: shows.filter(s => s.status === "done").length,
+    stopped: shows.filter(s => s.status === "stopped").length,
     all: shows.length,
   };
 
@@ -442,6 +490,7 @@ function viewShows() {
     ["watching", "Watching"],
     ["plan", "Plan to watch"],
     ["done", "Finished"],
+    ["stopped", "Stopped"],
     ["all", "All"],
   ].map(([key, label]) =>
     `<button class="chip ${showsFilter === key ? "active" : ""}" data-filter="${key}">${label} ${counts[key] ? "&middot; " + counts[key] : ""}</button>`
@@ -452,21 +501,19 @@ function viewShows() {
     body = `<div class="empty"><div class="big">No shows yet</div>Head to Search and add what you're watching.</div>`;
   } else if (!filtered.length) {
     body = `<div class="empty">Nothing in this list.</div>`;
+  } else if (showsFilter === "watching") {
+    const byRecency = [...filtered].sort((a, b) => lastWatchedAt(b) - lastWatchedAt(a));
+    const rotation = byRecency.filter(s => !isStale(s));
+    const shelved = byRecency.filter(s => isStale(s));
+    body = "";
+    if (rotation.length) {
+      body += `<div class="section-label">In rotation</div><div class="poster-grid">${rotation.map(posterCell).join("")}</div>`;
+    }
+    if (shelved.length) {
+      body += `<div class="section-label">It's been a while</div><div class="poster-grid">${shelved.map(posterCell).join("")}</div>`;
+    }
   } else {
-    body = `<div class="poster-grid">` + filtered.map(show => {
-      const posterUrl = TMDB.img(show.poster, "w342");
-      const remain = show.cache ? remainingAired(show) : null;
-      const badge = show.status === "done"
-        ? `<span class="badge done">&#10003;</span>`
-        : (remain ? `<span class="badge">${remain}</span>` : "");
-      return `
-        <div class="poster-cell" data-id="${show.id}" role="button" tabindex="0">
-          ${posterUrl ? `<img src="${posterUrl}" alt="${esc(show.name)}" loading="lazy">`
-                      : `<div class="noart">${esc(show.name)}</div>`}
-          ${badge}
-          <div class="poster-title">${esc(show.name)}</div>
-        </div>`;
-    }).join("") + `</div>`;
+    body = `<div class="poster-grid">${filtered.map(posterCell).join("")}</div>`;
   }
 
   $view.replaceChildren(h(`<div class="filters">${chips}</div>${body}`));
@@ -478,6 +525,24 @@ function viewShows() {
     el.addEventListener("click", go);
     el.addEventListener("keydown", e => { if (e.key === "Enter") go(); });
   });
+}
+
+function posterCell(show) {
+  const posterUrl = TMDB.img(show.poster, "w342");
+  const remain = show.cache ? remainingAired(show) : null;
+  const badge = show.status === "done"
+    ? `<span class="badge done">&#10003;</span>`
+    : (remain ? `<span class="badge">${remain}</span>` : "");
+  const caption = (show.status === "watching" && isStale(show) && Object.keys(show.watched || {}).length)
+    ? `${esc(show.name)} &middot; ${timeAgo(lastWatchedAt(show))}`
+    : esc(show.name);
+  return `
+    <div class="poster-cell" data-id="${show.id}" role="button" tabindex="0">
+      ${posterUrl ? `<img src="${posterUrl}" alt="${esc(show.name)}" loading="lazy">`
+                  : `<div class="noart">${esc(show.name)}</div>`}
+      ${badge}
+      <div class="poster-title">${caption}</div>
+    </div>`;
 }
 
 /* ---- SEARCH ---- */
@@ -542,15 +607,20 @@ function renderResults(container, results) {
           <div class="result-name">${esc(r.name)}</div>
           <div class="result-sub">${year || "&mdash;"}${r.origin_country && r.origin_country.length ? " &middot; " + esc(r.origin_country[0]) : ""}</div>
         </div>
-        <button class="addbtn" ${have ? "disabled" : ""}>${have ? "Added &#10003;" : "+ Add"}</button>
+        <div class="add-pair">
+          ${have
+            ? `<button class="addbtn" disabled>Added &#10003;</button>`
+            : `<button class="addbtn" data-add="watching">+ Watching</button>
+               <button class="addbtn plan" data-add="plan">+ Later</button>`}
+        </div>
       </div>`);
-    const btn = el.querySelector("button");
     if (!have) {
-      btn.addEventListener("click", () => {
-        addShow(r);
-        btn.disabled = true;
-        btn.innerHTML = "Added &#10003;";
-      });
+      const pair = el.querySelector(".add-pair");
+      pair.querySelectorAll("[data-add]").forEach(btn =>
+        btn.addEventListener("click", () => {
+          addShow(r, btn.dataset.add);
+          pair.innerHTML = `<button class="addbtn" disabled>Added &#10003;</button>`;
+        }));
     }
     frag.append(el);
   }
@@ -596,6 +666,7 @@ async function viewShowDetail(id) {
     ["watching", "Watching"],
     ["plan", "Plan to watch"],
     ["done", "Finished"],
+    ["stopped", "Stopped"],
   ].map(([key, label]) =>
     `<button class="chip ${show.status === key ? "active" : ""}" data-status="${key}">${label}</button>`
   ).join("");
@@ -704,6 +775,162 @@ async function viewShowDetail(id) {
   });
 }
 
+/* ----------------------- TV Time import -----------------------
+   Reads the TV Time GDPR/export CSV (tracking records). Two row types:
+   - "user-series-…"   one per show: TVDB s_id, name, archived/for-later flags
+   - "watch-episode-…" one per watched episode: s_id, s_no, ep_no, created_at
+   TVTime uses TVDB IDs; we translate via TMDB's /find endpoint,
+   falling back to a name search. */
+
+function parseDelimited(text) {
+  const firstNL = text.indexOf("\n");
+  const firstLine = firstNL === -1 ? text : text.slice(0, firstNL);
+  const delim = (firstLine.match(/\t/g) || []).length >= (firstLine.match(/,/g) || []).length ? "\t" : ",";
+
+  const rows = [];
+  let row = [], field = "", inQ = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQ) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else inQ = false;
+      } else field += c;
+    } else {
+      if (c === '"') inQ = true;
+      else if (c === delim) { row.push(field); field = ""; }
+      else if (c === "\n") { row.push(field); rows.push(row); row = []; field = ""; }
+      else if (c !== "\r") field += c;
+    }
+  }
+  if (field.length || row.length) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+function parseTVTimeDate(str) {
+  // "8/5/2018 15:43" (M/D/YYYY H:mm)
+  if (!str) return null;
+  const m = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:\s+(\d{1,2}):(\d{2}))?/);
+  if (!m) return null;
+  return new Date(+m[3], +m[1] - 1, +m[2], +(m[4] || 0), +(m[5] || 0)).getTime();
+}
+
+function parseTVTimeExport(text) {
+  const rows = parseDelimited(text);
+  if (rows.length < 2) throw new Error("Empty file");
+  const header = rows[0].map(x => String(x).trim().toLowerCase());
+  const col = n => header.indexOf(n);
+
+  const iKey = col("key"), iCreated = col("created_at"), iSid = col("s_id"),
+        iSno = col("s_no"), iEpno = col("ep_no"),
+        iArch = col("is_archived"), iLater = col("is_for_later"),
+        iName = col("series_name"),
+        iSeason2 = col("season_number"), iEp2 = col("episode_number");
+  if (iKey === -1 || iSid === -1) throw new Error("This doesn't look like a TV Time export");
+
+  const bySid = new Map(); // TVDB id -> { tvdbId, name, status, watched: {sXeY: ts} }
+  const getEntry = (sid) => {
+    if (!bySid.has(sid)) bySid.set(sid, { tvdbId: sid, name: "", status: "watching", watched: {} });
+    return bySid.get(sid);
+  };
+
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r];
+    if (!row || row.length < 3) continue;
+    const key = String(row[iKey] || "");
+    const sid = String(row[iSid] || "").trim();
+    if (!sid) continue;
+
+    if (key.startsWith("user-series-")) {
+      const entry = getEntry(sid);
+      entry.name = String(row[iName] || "").trim() || entry.name;
+      const truthy = v => String(v).trim().toUpperCase() === "TRUE";
+      if (iLater !== -1 && truthy(row[iLater])) entry.status = "plan";
+      else if (iArch !== -1 && truthy(row[iArch])) entry.status = "stopped";
+      else entry.status = "watching";
+    } else if (key.startsWith("watch-episode-")) {
+      const s = Number(row[iSno]) || (iSeason2 !== -1 ? Number(row[iSeason2]) : 0);
+      const e = Number(row[iEpno]) || (iEp2 !== -1 ? Number(row[iEp2]) : 0);
+      if (!s || !e) continue; // skips specials (season 0) and malformed rows
+      const entry = getEntry(sid);
+      entry.name = String(row[iName] || "").trim() || entry.name;
+      const ts = parseTVTimeDate(iCreated !== -1 ? row[iCreated] : "") || Date.now();
+      const k = epKey(s, e);
+      if (!entry.watched[k] || ts < entry.watched[k]) entry.watched[k] = ts;
+    }
+  }
+  return [...bySid.values()];
+}
+
+async function matchTVTimeShow(item) {
+  // 1) exact translation via TVDB id
+  if (item.tvdbId && /^\d+$/.test(item.tvdbId)) {
+    try {
+      const found = await TMDB.get(`/find/${item.tvdbId}`, { external_source: "tvdb_id" });
+      if (found.tv_results && found.tv_results.length) return found.tv_results[0];
+    } catch (e) { /* fall through to name search */ }
+  }
+  // 2) name search fallback (strip TVTime's "(US)" style suffixes on retry)
+  if (item.name) {
+    let data = await TMDB.searchTV(item.name);
+    if (data.results && data.results.length) return data.results[0];
+    const cleaned = item.name.replace(/\s*\((US|UK|\d{4})\)\s*$/i, "").trim();
+    if (cleaned && cleaned !== item.name) {
+      data = await TMDB.searchTV(cleaned);
+      if (data.results && data.results.length) return data.results[0];
+    }
+  }
+  return null;
+}
+
+async function runTVTimeImport(items, onProgress) {
+  const summary = { shows: 0, episodes: 0, unmatched: [] };
+  let done = 0;
+  const queue = [...items];
+
+  const worker = async () => {
+    while (queue.length) {
+      const item = queue.shift();
+      try {
+        const tv = await matchTVTimeShow(item);
+        if (!tv) {
+          summary.unmatched.push(item.name || ("TVDB #" + item.tvdbId));
+        } else {
+          const id = String(tv.id);
+          if (!state.shows[id]) {
+            state.shows[id] = {
+              id: tv.id,
+              name: tv.name,
+              poster: tv.poster_path || null,
+              year: (tv.first_air_date || "").slice(0, 4),
+              status: item.status,
+              watched: {},
+              addedAt: Date.now(),
+              cache: null,
+            };
+          }
+          const show = state.shows[id];
+          let added = 0;
+          for (const [k, ts] of Object.entries(item.watched)) {
+            if (!show.watched[k]) { show.watched[k] = ts; added++; }
+          }
+          summary.shows++;
+          summary.episodes += added;
+        }
+      } catch (e) {
+        summary.unmatched.push(item.name || ("TVDB #" + item.tvdbId));
+      }
+      done++;
+      onProgress(done, items.length, item.name);
+      if (done % 10 === 0) persist(); // checkpoint so a mid-import close loses little
+    }
+  };
+
+  await Promise.all(Array.from({ length: 4 }, worker));
+  persist();
+  return summary;
+}
+
 /* ---- SETTINGS ---- */
 
 function viewSettings() {
@@ -732,6 +959,16 @@ function viewSettings() {
     </div>
 
     <div class="card">
+      <h3>Import from TV Time</h3>
+      <p>Have a TV Time data export? Upload the tracking CSV and your full watch history rebuilds here — shows are matched to TMDB automatically, watch dates preserved. Safe to re-run; already-imported episodes are skipped.</p>
+      <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center">
+        <button class="btn btn-check" id="tvtBtn">Choose CSV file</button>
+        <input type="file" id="tvtFile" accept=".csv,text/csv,text/plain,.tsv" style="display:none">
+      </div>
+      <p id="tvtStatus" style="margin:10px 0 0; min-height:1em"></p>
+    </div>
+
+    <div class="card">
       <h3>Backup</h3>
       <p>Everything lives in this browser. Export a backup before clearing Safari data, or to move to another device.</p>
       <div style="display:flex; gap:8px; flex-wrap:wrap">
@@ -756,6 +993,55 @@ function viewSettings() {
     } catch (e) {
       toast(e.message === "NO_KEY" ? "Paste a key first" : "TMDB rejected that key");
     }
+  });
+
+  const tvtStatus = $view.querySelector("#tvtStatus");
+  $view.querySelector("#tvtBtn").addEventListener("click", () =>
+    $view.querySelector("#tvtFile").click());
+
+  $view.querySelector("#tvtFile").addEventListener("change", async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    e.target.value = "";
+
+    if (!TMDB.hasKey()) {
+      tvtStatus.textContent = "Save your TMDB key above first — it's needed to match your shows.";
+      return;
+    }
+
+    let items;
+    try {
+      items = parseTVTimeExport(await file.text());
+    } catch (err) {
+      tvtStatus.textContent = "Couldn't read that file: " + err.message;
+      return;
+    }
+    const epTotal = items.reduce((n, it) => n + Object.keys(it.watched).length, 0);
+    if (!items.length) {
+      tvtStatus.textContent = "No shows found in that file.";
+      return;
+    }
+    if (!confirm(`Found ${items.length} shows and ${epTotal.toLocaleString()} watched episodes. Import now? (Takes a minute or two.)`)) {
+      tvtStatus.textContent = "Import cancelled.";
+      return;
+    }
+
+    const btn = $view.querySelector("#tvtBtn");
+    btn.disabled = true;
+    try {
+      const summary = await runTVTimeImport(items, (done, total, name) => {
+        tvtStatus.textContent = `Matching ${done} of ${total}: ${name || "…"}`;
+      });
+      let msg = `Done — imported ${summary.shows} shows, ${summary.episodes.toLocaleString()} episodes.`;
+      if (summary.unmatched.length) {
+        msg += ` Couldn't match ${summary.unmatched.length}: ${summary.unmatched.slice(0, 8).join(", ")}${summary.unmatched.length > 8 ? "…" : ""} — add those via Search.`;
+      }
+      tvtStatus.textContent = msg;
+      toast("TV Time history imported");
+    } catch (err) {
+      tvtStatus.textContent = "Import stopped: " + err.message + " — progress so far was saved; re-run to finish.";
+    }
+    btn.disabled = false;
   });
 
   $view.querySelector("#exportBtn").addEventListener("click", () => {
@@ -831,8 +1117,7 @@ document.getElementById("refreshBtn").addEventListener("click", async (e) => {
   const btn = e.currentTarget;
   if (!TMDB.hasKey()) { toast("Add your TMDB key in Settings first"); return; }
   btn.classList.add("spin");
-  const shows = Object.values(state.shows);
-  await Promise.all(shows.map(s => ensureEpisodes(s, true).catch(() => {})));
+  await ensureAll(Object.values(state.shows), true);
   btn.classList.remove("spin");
   toast("Episode data refreshed");
   render();

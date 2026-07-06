@@ -56,6 +56,7 @@ Watched episodes are stored as `sXeY` keys with a timestamp (so watch-date stats
 - Show detail: per-episode checkboxes, mark/clear season, "I'm caught up" (marks all aired), future episodes shown dimmed with air dates
 - Auto-status: a show flips to Finished when every aired episode is watched and the series has ended
 - Export/import JSON backup in Settings
+- **Import from TV Time** (Settings tab): upload your TV Time export CSV and your history rebuilds. TVDB series IDs are translated to TMDB via the `/find` endpoint with name search as a fallback; watch dates are preserved; archived shows become "Stopped" and for-later shows become "Plan to watch." Safe to re-run — already-imported episodes are skipped — and progress saves every 10 shows, so an interrupted import resumes where it left off.
 
 ## Moving to Firebase later
 
