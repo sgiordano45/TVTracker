@@ -153,6 +153,7 @@ async function ensureEpisodes(show, force) {
   try {
     const data = await fetchEpisodeList(show.id);
     show.cache = { fetchedAt: Date.now(), ...data };
+    autoStatus(show); // e.g. caught-up show just got marked Ended by TMDB -> Finished
     persist();
   } catch (e) {
     if (!show.cache) throw e; // nothing cached and fetch failed
@@ -284,8 +285,11 @@ function autoStatus(show) {
   const aired = airedEpisodes(show);
   const allWatched = aired.length > 0 && aired.every(ep => show.watched[epKey(ep.s, ep.e)]);
   const ended = ["Ended", "Canceled"].includes(show.cache.status);
-  if (show.status === "stopped") return; // user's call — don't auto-flip
-  if (allWatched && ended && show.status !== "done") show.status = "done";
+  if (allWatched && ended) {              // finished is finished, even if archived/stopped
+    if (show.status !== "done") show.status = "done";
+    return;
+  }
+  if (show.status === "stopped") return;  // abandoned partway — user's call, don't touch
   if (!allWatched && show.status === "done") show.status = "watching";
 }
 
