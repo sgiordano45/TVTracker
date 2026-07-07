@@ -1,13 +1,14 @@
 /* Queue service worker — app shell cached, TMDB data always network,
    TMDB poster images cached opportunistically. Bump VERSION on deploys. */
 
-const VERSION = "queue-v5";
+const VERSION = "queue-v7";
 const SHELL = [
   "./",
   "./index.html",
   "./styles.css",
   "./app.js",
   "./manifest.json",
+  "./firebase-config.js",
   "./icons/icon-180.png",
   "./icons/icon-512.png",
 ];
@@ -51,7 +52,7 @@ self.addEventListener("fetch", (e) => {
     caches.match(e.request).then((hit) =>
       hit ||
       fetch(e.request).then((res) => {
-        if (res.ok && (url.origin === location.origin || url.hostname.includes("fonts."))) {
+        if (res.ok && (url.origin === location.origin || url.hostname.includes("fonts.") || url.hostname === "www.gstatic.com")) {
           const copy = res.clone();
           caches.open(VERSION).then((c) => c.put(e.request, copy));
         }

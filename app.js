@@ -56,7 +56,123 @@ const Store = {
 };
 
 let state = Store.load();
-function persist() { Store.save(state); }
+function persist() { Store.save(state); cloudPush(); }
+
+/* ----------------------- Firebase sync (optional) -----------------------
+   Local-first: localStorage is always written immediately; Firestore gets a
+   debounced copy of everything EXCEPT episode caches (bulky, regenerable).
+   Signed out or unconfigured, the app is fully functional locally. */
+
+let fbAuth = null, fbDb = null, currentUser = null;
+let pushTimer = null;
+
+function cloudEnabled() {
+  return typeof firebase !== "undefined" &&
+    window.FIREBASE_CONFIG &&
+    window.FIREBASE_CONFIG.apiKey &&
+    !window.FIREBASE_CONFIG.apiKey.startsWith("PASTE");
+}
+
+function initFirebase() {
+  if (!cloudEnabled()) return;
+  try {
+    firebase.initializeApp(window.FIREBASE_CONFIG);
+    fbAuth = firebase.auth();
+    fbDb = firebase.firestore();
+    fbAuth.getRedirectResult().catch(() => {}); // completes iOS redirect sign-ins
+    fbAuth.onAuthStateChanged(async (user) => {
+      currentUser = user || null;
+      if (user) {
+        await cloudPullOrSeed();
+        await loadSharedTmdbKey();
+      }
+      render();
+    });
+  } catch (e) {
+    console.error("Firebase init failed", e);
+  }
+}
+
+function stripForCloud(s) {
+  const shows = {};
+  for (const [id, sh] of Object.entries(s.shows)) {
+    const { cache, ...rest } = sh; // caches stay local
+    shows[id] = rest;
+  }
+  return {
+    settings: { tmdbKey: s.settings.tmdbKey || "" },
+    shows,
+    updatedAt: Date.now(),
+  };
+}
+
+async function cloudPullOrSeed() {
+  try {
+    const ref = fbDb.collection("users").doc(currentUser.uid);
+    const snap = await ref.get();
+    if (snap.exists) {
+      // cloud is the source of truth; graft local episode caches back on
+      const cloud = snap.data();
+      const localCaches = {};
+      for (const [id, sh] of Object.entries(state.shows)) {
+        if (sh.cache) localCaches[id] = sh.cache;
+      }
+      state.shows = cloud.shows || {};
+      for (const [id, c] of Object.entries(localCaches)) {
+        if (state.shows[id]) state.shows[id].cache = c;
+      }
+      if (cloud.settings && cloud.settings.tmdbKey && !state.settings.tmdbKey) {
+        state.settings.tmdbKey = cloud.settings.tmdbKey;
+      }
+      Store.save(state);
+      toast("Library synced");
+    } else if (Object.keys(state.shows).length) {
+      // first sign-in on the device that has your data: seed the cloud
+      await ref.set(stripForCloud(state));
+      toast("Library uploaded to your account");
+    }
+  } catch (e) {
+    console.error("cloud pull failed", e);
+    toast("Cloud sync unavailable — working locally");
+  }
+}
+
+async function loadSharedTmdbKey() {
+  // optional shared app key at config/app { tmdbKey } — read-only to users
+  try {
+    const snap = await fbDb.collection("config").doc("app").get();
+    if (snap.exists && snap.data().tmdbKey && !state.settings.tmdbKey.trim()) {
+      state.settings.tmdbKey = snap.data().tmdbKey;
+      Store.save(state);
+    }
+  } catch (e) { /* config doc is optional */ }
+}
+
+function cloudPush() {
+  if (!currentUser || !fbDb) return;
+  clearTimeout(pushTimer);
+  pushTimer = setTimeout(() => {
+    fbDb.collection("users").doc(currentUser.uid)
+      .set(stripForCloud(state))
+      .catch(e => console.error("cloud push failed", e));
+  }, 2000);
+}
+
+async function signIn() {
+  const provider = new firebase.auth.GoogleAuthProvider();
+  try {
+    await fbAuth.signInWithPopup(provider);
+  } catch (e) {
+    // popups are unreliable in installed iOS PWAs; redirect flow as fallback
+    try { await fbAuth.signInWithRedirect(provider); }
+    catch (e2) { toast("Sign-in failed: " + (e2.message || "unknown error")); }
+  }
+}
+
+function signOutUser() {
+  if (fbAuth) fbAuth.signOut();
+  toast("Signed out — this device keeps a local copy");
+}
 
 /* ----------------------- TMDB client ----------------------- */
 
@@ -389,10 +505,11 @@ async function viewUpNext() {
   const staleSection = ready.filter(c => isStale(c.show));
   const upcomingSection = cards.filter(c => !hasAired(c.next));
 
-  // within sections: most recently watched first feels right for "continue",
-  // most-behind first for the backlog
+  // sort by most recently watched, in every section;
+  // "Coming up" by soonest air date since nothing's watchable yet
   continueSection.sort((a, b) => lastWatchedAt(b.show) - lastWatchedAt(a.show));
-  staleSection.sort((a, b) => b.behind - a.behind);
+  staleSection.sort((a, b) => lastWatchedAt(b.show) - lastWatchedAt(a.show));
+  upcomingSection.sort((a, b) => (a.next.air || "9999").localeCompare(b.next.air || "9999"));
 
   if (continueSection.length) {
     frag.append(h(`<div class="section-label">Continue watching</div>`));
@@ -943,7 +1060,25 @@ function viewSettings() {
   const shows = Object.values(state.shows);
   const totalWatched = shows.reduce((n, s) => n + watchedCount(s), 0);
 
+  const accountCard = !cloudEnabled()
+    ? `<div class="card">
+        <h3>Account &amp; sync</h3>
+        <p>Cloud sync is off. Paste your Firebase web config into <code>firebase-config.js</code> to enable Google sign-in and cross-device sync. Everything works locally in the meantime.</p>
+      </div>`
+    : currentUser
+      ? `<div class="card">
+          <h3>Account &amp; sync</h3>
+          <p>Signed in as <strong>${esc(currentUser.email || currentUser.displayName || "Google account")}</strong>. Your library syncs to this account — changes here appear on any device you sign into.</p>
+          <button class="btn btn-quiet" id="signOutBtn">Sign out</button>
+        </div>`
+      : `<div class="card">
+          <h3>Account &amp; sync</h3>
+          <p>Sign in to sync your library across devices. First sign-in from this device uploads what's here.</p>
+          <button class="btn btn-check" id="signInBtn">Sign in with Google</button>
+        </div>`;
+
   $view.replaceChildren(h(`
+    ${accountCard}
     <div class="card">
       <h3>TMDB API key</h3>
       <p>Episode data comes from <a href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener">The Movie Database</a>.
@@ -981,6 +1116,11 @@ function viewSettings() {
         <input type="file" id="importFile" accept="application/json" style="display:none">
       </div>
     </div>`));
+
+  const signInBtn = $view.querySelector("#signInBtn");
+  if (signInBtn) signInBtn.addEventListener("click", signIn);
+  const signOutBtn = $view.querySelector("#signOutBtn");
+  if (signOutBtn) signOutBtn.addEventListener("click", () => { signOutUser(); viewSettings(); });
 
   $view.querySelector("#saveKey").addEventListener("click", () => {
     state.settings.tmdbKey = $view.querySelector("#tmdbKey").value.trim();
@@ -1138,4 +1278,5 @@ if ("serviceWorker" in navigator) {
 }
 
 /* go */
+initFirebase();
 onHashChange();

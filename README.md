@@ -58,6 +58,23 @@ Watched episodes are stored as `sXeY` keys with a timestamp (so watch-date stats
 - Export/import JSON backup in Settings
 - **Import from TV Time** (Settings tab): upload your TV Time export CSV and your history rebuilds. TVDB series IDs are translated to TMDB via the `/find` endpoint with name search as a fallback; watch dates are preserved; archived shows become "Stopped" and for-later shows become "Plan to watch." Safe to re-run — already-imported episodes are skipped — and progress saves every 10 shows, so an interrupted import resumes where it left off.
 
+## Firebase sync setup (cross-device + Google sign-in)
+
+Console steps (one time):
+1. **Authentication** → Sign-in method → enable **Google**
+2. **Authentication** → Settings → **Authorized domains** → add `<username>.github.io`
+3. **Firestore Database** → Create database (production mode)
+4. Firestore → **Rules** → paste the contents of `firestore.rules` → Publish
+5. (Optional, recommended) Firestore → Data → create collection `config`, doc ID `app`, string field `tmdbKey` = your TMDB key. Every signed-in user then gets the key automatically — no Settings step for them.
+6. Project settings (gear) → Your apps → **Add web app** → copy the config object into `firebase-config.js`
+
+How sync behaves:
+- **Local-first.** localStorage is written instantly; Firestore gets a debounced (2s) copy. The app works offline and signed-out.
+- **Episode caches never sync** — they're bulky and rebuild from TMDB on each device. Only shows, watch history, and statuses sync (keeps you far under Firestore's 1MB doc limit).
+- **First sign-in seeds the cloud**: if your account has no cloud data but this device does, the local library uploads. So: do the TVTime import + cleanup wherever you like, sign in there, and every other device inherits it.
+- **After that, cloud wins**: signing in on any device replaces its local library with the account's.
+- iOS note: in the installed PWA, sign-in tries a popup first and falls back to a redirect flow. If sign-in misbehaves in standalone mode, sign in once via the same URL in a Safari tab isn't a fix (separate storage) — use the redirect flow inside the app; it works on current iOS.
+
 ## Moving to Firebase later
 
 Everything reads/writes through the `Store` object at the top of `app.js` (`load`, `save`, `exportJSON`, `importJSON`). To sync across devices or support multiple users:
