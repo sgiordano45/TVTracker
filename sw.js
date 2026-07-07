@@ -1,7 +1,7 @@
 /* Queue service worker — app shell cached, TMDB data always network,
    TMDB poster images cached opportunistically. Bump VERSION on deploys. */
 
-const VERSION = "queue-v8";
+const VERSION = "queue-v9";
 const SHELL = [
   "./",
   "./index.html",

@@ -1,12 +1,12 @@
-/* Firebase web app config for Queue.
-   The app reads window.FIREBASE_CONFIG — keep that exact name. */
+/* Paste your Firebase web app config here.
+   Firebase Console → Project settings (gear) → Your apps → Web app → SDK setup → Config.
+   Until you paste it, the app runs in local-only mode (no sign-in, everything still works). */
 
 window.FIREBASE_CONFIG = {
-  apiKey: "AIzaSyCvbRyWpOOFr4id9_8GDWlpShmFlo7arvk",
-  authDomain: "queue-tvtracker.firebaseapp.com",
-  projectId: "queue-tvtracker",
-  storageBucket: "queue-tvtracker.firebasestorage.app",
-  messagingSenderId: "108983297119",
-  appId: "1:108983297119:web:dae27399765666f29827ea",
-  measurementId: "G-BDDDCGP9GR",
+  apiKey: "PASTE_API_KEY",
+  authDomain: "your-project.firebaseapp.com",
+  projectId: "your-project",
+  storageBucket: "your-project.appspot.com",
+  messagingSenderId: "000000000000",
+  appId: "1:000000000000:web:xxxxxxxxxxxx",
 };

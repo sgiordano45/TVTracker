@@ -929,11 +929,16 @@ function parseDelimited(text) {
 }
 
 function parseTVTimeDate(str) {
-  // "8/5/2018 15:43" (M/D/YYYY H:mm)
   if (!str) return null;
-  const m = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:\s+(\d{1,2}):(\d{2}))?/);
-  if (!m) return null;
-  return new Date(+m[3], +m[1] - 1, +m[2], +(m[4] || 0), +(m[5] || 0)).getTime();
+  // real export format: "2021-01-11 12:31:34" (ISO-ish)
+  let m = str.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?/);
+  if (m) return new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0)).getTime();
+  m = str.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (m) return new Date(+m[1], +m[2] - 1, +m[3]).getTime();
+  // spreadsheet display format: "8/5/2018 15:43" (M/D/YYYY H:mm)
+  m = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:\s+(\d{1,2}):(\d{2}))?/);
+  if (m) return new Date(+m[3], +m[1] - 1, +m[2], +(m[4] || 0), +(m[5] || 0)).getTime();
+  return null;
 }
 
 function parseTVTimeExport(text) {
@@ -969,7 +974,7 @@ function parseTVTimeExport(text) {
       if (iLater !== -1 && truthy(row[iLater])) entry.status = "plan";
       else if (iArch !== -1 && truthy(row[iArch])) entry.status = "stopped";
       else entry.status = "watching";
-    } else if (key.startsWith("watch-episode-")) {
+    } else if (key.startsWith("watch-episode-") || key.startsWith("rewatch-episode-")) {
       const s = Number(row[iSno]) || (iSeason2 !== -1 ? Number(row[iSeason2]) : 0);
       const e = Number(row[iEpno]) || (iEp2 !== -1 ? Number(row[iEp2]) : 0);
       if (!s || !e) continue; // skips specials (season 0) and malformed rows
@@ -1033,7 +1038,12 @@ async function runTVTimeImport(items, onProgress) {
           const show = state.shows[id];
           let added = 0;
           for (const [k, ts] of Object.entries(item.watched)) {
-            if (!show.watched[k]) { show.watched[k] = ts; added++; }
+            // earliest date wins: repairs bad timestamps from a prior import
+            // without clobbering history, and stays idempotent
+            if (!show.watched[k] || ts < show.watched[k]) {
+              if (!show.watched[k]) added++;
+              show.watched[k] = ts;
+            }
           }
           summary.shows++;
           summary.episodes += added;
