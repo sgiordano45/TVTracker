@@ -1054,6 +1054,8 @@ async function runTVTimeImport(items, onProgress) {
 
 /* ---- SETTINGS ---- */
 
+let showKeyEditor = false;
+
 function viewSettings() {
   $brand.innerHTML = '<span class="accent">SETTINGS</span>';
 
@@ -1077,9 +1079,16 @@ function viewSettings() {
           <button class="btn btn-check" id="signInBtn">Sign in with Google</button>
         </div>`;
 
-  $view.replaceChildren(h(`
-    ${accountCard}
-    <div class="card">
+  const keyConfigured = currentUser && TMDB.hasKey() && !showKeyEditor;
+  const tmdbCard = keyConfigured
+    ? `<div class="card">
+        <h3>TMDB API key</h3>
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:10px">
+          <p style="margin:0">Configured via your account <span style="color:var(--green)">&#10003;</span></p>
+          <button class="minibtn" id="editKey">Change</button>
+        </div>
+      </div>`
+    : `<div class="card">
       <h3>TMDB API key</h3>
       <p>Episode data comes from <a href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener">The Movie Database</a>.
       Create a free account, request an API key (personal use), and paste either the short v3 key or the long Read Access Token here. It's stored only on this device.</p>
@@ -1088,7 +1097,11 @@ function viewSettings() {
         <button class="btn btn-check" id="saveKey">Save key</button>
         <button class="btn btn-quiet" id="testKey">Test</button>
       </div>
-    </div>
+    </div>`;
+
+  $view.replaceChildren(h(`
+    ${accountCard}
+    ${tmdbCard}
 
     <div class="card">
       <h3>Your numbers</h3>
@@ -1122,13 +1135,20 @@ function viewSettings() {
   const signOutBtn = $view.querySelector("#signOutBtn");
   if (signOutBtn) signOutBtn.addEventListener("click", () => { signOutUser(); viewSettings(); });
 
-  $view.querySelector("#saveKey").addEventListener("click", () => {
+  const editKeyBtn = $view.querySelector("#editKey");
+  if (editKeyBtn) editKeyBtn.addEventListener("click", () => { showKeyEditor = true; viewSettings(); });
+
+  const saveKeyBtn = $view.querySelector("#saveKey");
+  if (saveKeyBtn) saveKeyBtn.addEventListener("click", () => {
     state.settings.tmdbKey = $view.querySelector("#tmdbKey").value.trim();
     persist();
+    showKeyEditor = false;
     toast("Key saved");
+    viewSettings();
   });
 
-  $view.querySelector("#testKey").addEventListener("click", async () => {
+  const testKeyBtn = $view.querySelector("#testKey");
+  if (testKeyBtn) testKeyBtn.addEventListener("click", async () => {
     state.settings.tmdbKey = $view.querySelector("#tmdbKey").value.trim();
     persist();
     try {
