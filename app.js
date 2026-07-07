@@ -670,7 +670,7 @@ function viewShows() {
 }
 
 function posterCell(show) {
-  const posterUrl = TMDB.img(show.poster, "w342");
+  const posterUrl = TMDB.img(show.poster, "w185"); // grid cells are small; half the bytes of w342
   const remain = show.cache ? remainingAired(show) : null;
   const badge = show.status === "done"
     ? `<span class="badge done">&#10003;</span>`
@@ -680,7 +680,7 @@ function posterCell(show) {
     : esc(show.name);
   return `
     <div class="poster-cell" data-id="${show.id}" role="button" tabindex="0">
-      ${posterUrl ? `<img src="${posterUrl}" alt="${esc(show.name)}" loading="lazy">`
+      ${posterUrl ? `<img src="${posterUrl}" alt="${esc(show.name)}" loading="lazy" decoding="async">`
                   : `<div class="noart">${esc(show.name)}</div>`}
       ${badge}
       <div class="poster-title">${caption}</div>

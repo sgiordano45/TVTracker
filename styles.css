@@ -230,7 +230,16 @@ img { display: block; }
 }
 @media (min-width: 480px) { .poster-grid { grid-template-columns: repeat(4, 1fr); } }
 
-.poster-cell { position: relative; }
+.poster-cell {
+  position: relative;
+  /* critical: 1fr = minmax(auto, 1fr); without min-width:0 the nowrap
+     caption's min-content blows out the column and cells render huge */
+  min-width: 0;
+  /* huge grids (imported libraries): don't lay out / paint offscreen cells.
+     intrinsic size ≈ poster (2:3 of ~118px) + caption line */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 118px auto 200px;
+}
 .poster-cell img {
   width: 100%; aspect-ratio: 2/3; object-fit: cover;
   border-radius: 10px;
