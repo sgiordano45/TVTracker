@@ -1143,7 +1143,7 @@ function viewSettings() {
 
     <div class="card">
       <h3>Import from TV Time</h3>
-      <p>Have a TV Time data export? Upload the tracking CSV and your full watch history rebuilds here — shows are matched to TMDB automatically, watch dates preserved. Safe to re-run; already-imported episodes are skipped.</p>
+      <p>Have a TV Time data export? Upload the tracking CSV (tracking-prod-records-v2.csv) and your full watch history rebuilds here — shows are matched to TMDB automatically, watch dates preserved. Safe to re-run; already-imported episodes are skipped.</p>
       <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center">
         <button class="btn btn-check" id="tvtBtn">Choose CSV file</button>
         <input type="file" id="tvtFile" accept=".csv,text/csv,text/plain,.tsv" style="display:none">
