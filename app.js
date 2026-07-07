@@ -320,8 +320,27 @@ function lastWatchedAt(show) {
   return times.length ? Math.max(...times) : (show.addedAt || 0);
 }
 
+function isoToTs(iso) {
+  if (!iso) return 0;
+  const [y, m, d] = iso.split("-").map(Number);
+  return new Date(y, m - 1, d).getTime();
+}
+
+function freshnessAt(show) {
+  // a show is "active" from your last watch OR from a newly aired episode —
+  // so a returning show you're caught up on pops back into rotation when
+  // its new season drops
+  let t = lastWatchedAt(show);
+  const next = show.cache ? nextUnwatched(show) : null;
+  if (next && hasAired(next)) {
+    const airTs = isoToTs(next.air);
+    if (airTs > t) t = airTs;
+  }
+  return t;
+}
+
 function isStale(show) {
-  return Date.now() - lastWatchedAt(show) > STALE_DAYS * 24 * 60 * 60 * 1000;
+  return Date.now() - freshnessAt(show) > STALE_DAYS * 24 * 60 * 60 * 1000;
 }
 
 function timeAgo(ts) {
@@ -505,10 +524,10 @@ async function viewUpNext() {
   const staleSection = ready.filter(c => isStale(c.show));
   const upcomingSection = cards.filter(c => !hasAired(c.next));
 
-  // sort by most recently watched, in every section;
+  // sort by activity (last watch or new episode drop), most recent first;
   // "Coming up" by soonest air date since nothing's watchable yet
-  continueSection.sort((a, b) => lastWatchedAt(b.show) - lastWatchedAt(a.show));
-  staleSection.sort((a, b) => lastWatchedAt(b.show) - lastWatchedAt(a.show));
+  continueSection.sort((a, b) => freshnessAt(b.show) - freshnessAt(a.show));
+  staleSection.sort((a, b) => freshnessAt(b.show) - freshnessAt(a.show));
   upcomingSection.sort((a, b) => (a.next.air || "9999").localeCompare(b.next.air || "9999"));
 
   if (continueSection.length) {
@@ -552,8 +571,10 @@ function nextCard({ show, next, behind }) {
   const airedFlag = hasAired(next);
   const hasHistory = Object.keys(show.watched || {}).length > 0;
   const ago = hasHistory ? ` &middot; watched ${timeAgo(lastWatchedAt(show))}` : "";
+  const isNewDrop = airedFlag && (Date.now() - isoToTs(next.air)) < STALE_DAYS * 24 * 60 * 60 * 1000;
+  const newTag = isNewDrop ? `<span style="color:var(--amber)">New</span> &middot; ` : "";
   const meta = airedFlag
-    ? `${behind} unwatched${ago}`
+    ? `${newTag}${behind} unwatched${ago}`
     : (next.air ? `Airs ${fmtDate(next.air)}` : "Air date TBA");
 
   const el = h(`
@@ -623,7 +644,7 @@ function viewShows() {
   } else if (!filtered.length) {
     body = `<div class="empty">Nothing in this list.</div>`;
   } else if (showsFilter === "watching") {
-    const byRecency = [...filtered].sort((a, b) => lastWatchedAt(b) - lastWatchedAt(a));
+    const byRecency = [...filtered].sort((a, b) => freshnessAt(b) - freshnessAt(a));
     const rotation = byRecency.filter(s => !isStale(s));
     const shelved = byRecency.filter(s => isStale(s));
     body = "";
